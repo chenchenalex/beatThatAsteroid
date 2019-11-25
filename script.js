@@ -1,4 +1,6 @@
-const FPS = 30; // frames per second
+import NeuralNetwork from "./neural-network.js";
+
+const FPS = 35; // frames per second
 const FRICTION = 0.7; // friction coefficient of space (0 = no friction, 1 = lots of friction)
 const GAME_LIVES = 3; // starting number of lives
 const LASER_DIST = 0.6; // max distance laser can travel as fraction of screen width
@@ -22,13 +24,20 @@ const SHIP_THRUST = 5; // acceleration of the ship in pixels per second per seco
 const SHIP_TURN_SPD = 360; // turn speed in degrees per second
 const SHOW_BOUNDING = false; // show or hide collision bounding
 const SHOW_CENTRE_DOT = false; // show or hide ship's centre dot
-
 // developer flags
 const AUTOMATION_ON = true;
-const MUSIC_ON = true;
-const SOUND_ON = true;
+const MUSIC_ON = false;
+const SOUND_ON = false;
 const TEXT_FADE_TIME = 2.5; // text fade time in seconds
 const TEXT_SIZE = 40; // text font height in pixels
+const NUM_INPUTS = 4;
+const NUM_HIDDEN = 25;
+const NUM_OUTPUT = 1;
+const NUM_SAMPLES = 500000;
+const OUTPUT_LEFT = 0; // expected neural output of turning left
+const OUTPUT_RIGHT = 1; // expected neural output of turning right
+const OUTPUT_THRESHOLD = 0.05; // how close the prediction must be to commit to a turn;
+const RATE_OF_FIRE = 15; // shots per second
 
 /** @type {HTMLCanvasElement} */
 var canv = document.getElementById("gameCanvas");
@@ -49,16 +58,52 @@ var level, lives, roids, score, scoreHigh, ship, text, textAlpha;
 newGame();
 
 // set up the neural network
+let nn;
+let aiShootTime = 0;
 if (AUTOMATION_ON) {
-  // TODO machine learning code
+  nn = new NeuralNetwork(NUM_INPUTS, NUM_HIDDEN, NUM_OUTPUT);
+
+  let asteroidX;
+  let asteroidY;
+  let shipAngle;
+  let shipX;
+  let shipY;
+
+  for (let i = 0; i < NUM_SAMPLES; i++) {
+    // random asteroid location ( include off-screen data)
+    asteroidX = Math.random() * (canv.width + ROID_SIZE) - ROID_SIZE / 2;
+    asteroidY = Math.random() * (canv.height + ROID_SIZE) - ROID_SIZE / 2;
+
+    // ship's angle and position
+    shipAngle = Math.random() * Math.PI * 2;
+    shipX = ship.x;
+    shipY = ship.y;
+
+    // calculate the angle to the asteroid
+    let angle = angleToPoint(shipX, shipY, shipAngle, asteroidX, asteroidY);
+
+    // determine direction to turn
+    let direction = angle > Math.PI ? OUTPUT_LEFT : OUTPUT_RIGHT;
+
+    // train the network
+    nn.train(normaliseInput(asteroidX, asteroidY, angle, shipAngle), [
+      direction,
+    ]);
+  }
 }
 
-// set up event handlers
+// set up event handlersl
 document.addEventListener("keydown", keyDown);
 document.addEventListener("keyup", keyUp);
 
 // set up the game loop
 setInterval(update, 1000 / FPS);
+
+function angleToPoint(x, y, bearing, targetX, targetY) {
+  let angleToTarget = Math.atan2(-targetY + y, targetX - x);
+  let diff = bearing - angleToTarget;
+  return (diff + Math.PI * 2) % (Math.PI * 2); // get the number guaranteed to be betweeen 0 and 360 radius
+}
 
 function createAsteroidBelt() {
   roids = [];
@@ -164,19 +209,19 @@ function keyDown(/** @type {KeyboardEvent} */ ev) {
       shootLaser();
       break;
     case 37: // left arrow (rotate ship left)
-      ship.rot = ((SHIP_TURN_SPD / 180) * Math.PI) / FPS;
+      rotateShip(false);
       break;
     case 38: // up arrow (thrust the ship forward)
       ship.thrusting = true;
       break;
     case 39: // right arrow (rotate ship right)
-      ship.rot = ((-SHIP_TURN_SPD / 180) * Math.PI) / FPS;
+      rotateShip(true);
       break;
   }
 }
 
 function keyUp(/** @type {KeyboardEvent} */ ev) {
-  if (ship.dead) {
+  if (ship.dead || AUTOMATION_ON) {
     return;
   }
 
@@ -194,6 +239,11 @@ function keyUp(/** @type {KeyboardEvent} */ ev) {
       ship.rot = 0;
       break;
   }
+}
+
+function rotateShip(right) {
+  let sign = right ? -1 : 1;
+  ship.rot = (sign * ((SHIP_TURN_SPD / 180) * Math.PI)) / FPS;
 }
 
 function newAsteroid(x, y, r) {
@@ -264,6 +314,17 @@ function newShip() {
       y: 0,
     },
   };
+}
+
+function normaliseInput(roidX, roidY, angle, shipA) {
+  // normalise the values to between 0 and 1
+  let input = [];
+  input[0] = (roidX + ROID_SIZE / 2) / (canv.width + ROID_SIZE);
+  input[1] = (roidY + ROID_SIZE / 2) / (canv.height + ROID_SIZE);
+  input[2] = angle / (Math.PI * 2);
+  input[3] = shipA / (Math.PI * 2);
+
+  return input;
 }
 
 function shootLaser() {
@@ -341,6 +402,57 @@ function Sound(src, maxStreams = 1, vol = 1.0) {
 function update() {
   var blinkOn = ship.blinkNum % 2 == 0;
   var exploding = ship.explodeTime > 0;
+
+  // user the neural network to rotate and shoot
+  if (AUTOMATION_ON) {
+    // compute the closest asteroid
+    let c = 0; // closest index
+    let dist0 = distBetweenPoints(ship.x, ship.y, roids[0].x, roids[0].y);
+
+    for (let i = 1; i < roids.length; i++) {
+      let distCurrent = distBetweenPoints(
+        ship.x,
+        ship.y,
+        roids[i].x,
+        roids[i].y,
+      );
+      if (distCurrent < dist0) {
+        dist0 = distCurrent;
+        c = i;
+      }
+    }
+
+    let ax = roids[c].x; // asteeroid x
+    let ay = roids[c].y; // asteroid y
+    let sa = ship.a; // ship angle
+    let sx = ship.x;
+    let sy = ship.y;
+    let angle = angleToPoint(sx, sy, sa, ax, ay);
+    let prediction = nn.feedForward(normaliseInput(ax, ay, angle, sa))
+      ._data[0][0];
+
+    // make a turn
+    let deltaLeft = Math.abs(prediction - OUTPUT_LEFT);
+    let deltaRight = Math.abs(prediction - OUTPUT_RIGHT);
+
+    if (deltaLeft < OUTPUT_THRESHOLD) {
+      rotateShip(false);
+    } else if (deltaRight < OUTPUT_THRESHOLD) {
+      rotateShip(true);
+    } else {
+      // stop rotate
+      ship.rot = 0;
+    }
+
+    // shoot laser
+    if (aiShootTime == 0) {
+      aiShootTime = Math.ceil(FPS / RATE_OF_FIRE);
+      ship.canShoot = true;
+      shootLaser();
+    } else {
+      aiShootTime--;
+    }
+  }
 
   // tick the music
   music.tick();
@@ -615,6 +727,13 @@ function update() {
 
     // rotate the ship
     ship.a += ship.rot;
+
+    // keep the angle between 0 and 360 (two pi)
+    if (ship.a < 0) {
+      ship.a += Math.PI * 2;
+    } else if (ship.a >= Math.PI * 2) {
+      ship.a -= Math.PI * 2;
+    }
 
     // move the ship
     ship.x += ship.thrust.x;
